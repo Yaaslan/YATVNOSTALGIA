@@ -1,0 +1,113 @@
+name: YA TV - FFmpeg Live Broadcaster
+
+on:
+  repository_dispatch:
+    types: [yayin_baslat]
+
+jobs:
+  yayin_islemcisi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 6 saatlik maksimum emniyet kilidi
+
+    steps:
+      - name: Depoyu Hazirla
+        uses: actions/checkout@v4
+
+      - name: Sistem Araclari ve FFmpeg Kurulumu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+
+      - name: Yayın Parametrelerini Çözümle ve Dosyalari İndir
+        env:
+          PAYLOAD_VIDEO: ${{ github.event.client_payload.video_url }}
+          PAYLOAD_MUZIK: ${{ github.event.client_payload.muzik_url }}
+          PAYLOAD_LOGO: ${{ github.event.client_payload.logo_url }}
+          SEEK_TIME: ${{ github.event.client_payload.seek_time }}
+          TO_TIME: ${{ github.event.client_payload.to_time }}
+          MAX_SURE: ${{ github.event.client_payload.max_sure }}
+          VOD_KAYDET: ${{ github.event.client_payload.vod_kaydet }}
+        run: |
+          echo "=== YAYIN BİLGİLERİ ALINDI ==="
+          echo "Video URL: $PAYLOAD_VIDEO"
+          echo "Başlangıç Saniyesi (Seek): $SEEK_TIME"
+          echo "Maksimum Süre: $MAX_SURE sn"
+          
+          # Dropbox linklerini raw formata çevir (Garanti olsun)
+          V_URL=$(echo "$PAYLOAD_VIDEO" | sed 's/dl=0/raw=1/g' | sed 's/www.dropbox.com/dl.dropboxusercontent.com/g')
+          
+          echo "Video indiriliyor..."
+          curl -L -o input_video.mp4 "$V_URL"
+          
+          # Eğer logo verilmişse indir
+          if [ "$PAYLOAD_LOGO" != "YOK" ] && [ -n "$PAYLOAD_LOGO" ]; then
+            L_URL=$(echo "$PAYLOAD_LOGO" | sed 's/dl=0/raw=1/g' | sed 's/www.dropbox.com/dl.dropboxusercontent.com/g')
+            curl -L -o logo.png "$L_URL"
+            HAS_LOGO=true
+          else
+            HAS_LOGO=false
+          fi
+          
+          # Eğer arka plan müziği verilmişse indir
+          if [ "$PAYLOAD_MUZIK" != "YOK" ] && [ -n "$PAYLOAD_MUZIK" ]; then
+            M_URL=$(echo "$PAYLOAD_MUZIK" | sed 's/dl=0/raw=1/g' | sed 's/www.dropbox.com/dl.dropboxusercontent.com/g')
+            curl -L -o background_audio.mp3 "$M_URL"
+            HAS_MUZIK=true
+          else
+            HAS_MUZIK=false
+          fi
+          
+          echo "Dosyalar başarıyla indirildi ve hazırlandı."
+
+      - name: FFmpeg ile YouTube Canlı Yayın Motorunu Başlat
+        env:
+          YT_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+          SEEK_TIME: ${{ github.event.client_payload.seek_time }}
+          TO_TIME: ${{ github.event.client_payload.to_time }}
+          MAX_SURE: ${{ github.event.client_payload.max_sure }}
+        run: |
+          RTMP_URL="rtmp://a.rtmp.youtube.com/live2/$YT_STREAM_KEY"
+          
+          # Trim Out (Bitiş) ayarı
+          TO_PARAM=""
+          if [ "$TO_TIME" != "YOK" ] && [ -n "$TO_TIME" ]; then
+            TO_PARAM="-to $TO_TIME"
+          fi
+
+          # FFmpeg Filtre Zinciri (Logo ve Ölçekleme)
+          # Yayın kalitesi: 1080p, 30fps, Bitrate: 4500k (YouTube Standartlarına Tam Uyumlu)
+          FILTER_COMPLEX=""
+          MAP_AUDIO=""
+          
+          if [ "$HAS_LOGO" = true ] && [ "$HAS_MUZIK" = true ]; then
+            # Hem logo var hem özel arka plan müziği (Orijinal ses kapatılır, lofi döner)
+            FILTER_COMPLEX="-filter_complex [0:v]scale=1920:1080,setsar=1[v_scaled];[v_scaled][1:v]overlay=30:30[v_out]"
+            MAP_AUDIO="-map [v_out] -map 2:a"
+            FFMPEG_INPUTS="-ss $SEEK_TIME $TO_PARAM -i input_video.mp4 -i logo.png -stream_loop -1 -i background_audio.mp3"
+          elif [ "$HAS_LOGO" = true ] && [ "$HAS_MUZIK" = false ]; then
+            # Sadece logo var, orijinal ses korunur
+            FILTER_COMPLEX="-filter_complex [0:v]scale=1920:1080,setsar=1[v_scaled];[v_scaled][1:v]overlay=30:30[v_out]"
+            MAP_AUDIO="-map [v_out] -map 0:a"
+            FFMPEG_INPUTS="-ss $SEEK_TIME $TO_PARAM -i input_video.mp4 -i logo.png"
+          elif [ "$HAS_LOGO" = false ] && [ "$HAS_MUZIK" = true ]; then
+            # Logo yok, sadece özel müzik
+            FILTER_COMPLEX=""
+            MAP_AUDIO="-map 0:v -map 1:a"
+            FFMPEG_INPUTS="-ss $SEEK_TIME $TO_PARAM -i input_video.mp4 -stream_loop -1 -i background_audio.mp3"
+          else
+            # Hiçbiri yok, ham film ve orijinal ses
+            FILTER_COMPLEX=""
+            MAP_AUDIO="-map 0:v -map 0:a"
+            FFMPEG_INPUTS="-ss $SEEK_TIME $TO_PARAM -i input_video.mp4"
+          fi
+
+          echo "FFmpeg Çalıştırılıyor..."
+          
+          ffmpeg $FFMPEG_INPUTS \
+            $FILTER_COMPLEX \
+            $MAP_AUDIO \
+            -c:v libx264 -preset veryfast -b:v 4500k -maxrate 4500k -bufsize 9000k \
+            -pix_fmt yuv420p -g 60 -keyint_min 60 \
+            -c:a aac -b:a 128k -ar 44100 \
+            -t "$MAX_SURE" \
+            -f flv "$RTMP_URL"
